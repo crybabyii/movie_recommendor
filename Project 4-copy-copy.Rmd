@@ -1,0 +1,471 @@
+---
+title: "Project 4: Movie Recommender System"
+output: html_document
+---
+
+* Team members:
+    + Ella Zhang
+        - netID: yimuz2
+    + Houjun Tang 
+        - netID: houjunt2
+    + Yongxin Cai 
+        - netID: yc62
+
+
+```{r}
+library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(ggplot2)
+library(recommenderlab)
+library(DT)
+library(data.table)
+library(reshape2)
+library(shinyjs)
+library(devtools)
+
+
+# helper.R in link
+if (!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+source_url("https://github.com/pspachtholz/BookRecommender/blob/master/functions/helpers.R?raw=true")
+```
+### System I: Recommendation Based on Genres
+
+```{r}
+myurl = "https://liangfgithub.github.io/MovieData/"
+# use colClasses = 'NULL' to skip columns
+ratings = read.csv(paste0(myurl, 'ratings.dat?raw=true'), 
+                   sep = ':',
+                   colClasses = c('integer', 'NULL'), 
+                   header = FALSE)
+colnames(ratings) = c('UserID', 'MovieID', 'Rating', 'Timestamp')
+
+movies = readLines(paste0(myurl, 'movies.dat?raw=true'))
+movies = strsplit(movies, split = "::", fixed = TRUE, useBytes = TRUE)
+movies = matrix(unlist(movies), ncol = 3, byrow = TRUE)
+movies = data.frame(movies, stringsAsFactors = FALSE)
+colnames(movies) = c('MovieID', 'Title', 'Genres')
+movies$MovieID = as.integer(movies$MovieID)
+
+# convert accented characters
+movies$Title = iconv(movies$Title, "latin1", "UTF-8")
+
+ratings_per_movie = ratings %>% 
+  group_by(MovieID) %>% 
+  summarize(ratings_per_movie = n(), ave_ratings = mean(Rating)) %>%
+  inner_join(movies, by = 'MovieID')
+
+genres = as.data.frame(movies$Genres, stringsAsFactors=FALSE)
+tmp = as.data.frame(tstrsplit(genres[,1], '[|]',
+                              type.convert=TRUE),
+                    stringsAsFactors=FALSE)
+genre_list = c("Action", "Adventure", "Animation", 
+               "Children's", "Comedy", "Crime",
+               "Documentary", "Drama", "Fantasy",
+               "Film-Noir", "Horror", "Musical", 
+               "Mystery", "Romance", "Sci-Fi", 
+               "Thriller", "War", "Western")
+
+genre_matrix = matrix(0, nrow(movies), length(genre_list))
+for(i in 1:nrow(tmp)){
+  genre_matrix[i,genre_list %in% tmp[i,]]=1
+}
+
+genre_matrix = cbind("MovieID" = movies$MovieID,genre_matrix)
+
+
+total_data = left_join(ratings_per_movie, data.frame(genre_matrix), by = "MovieID")
+colnames(total_data) = c("MovieID", "ratings_per_movie", "ave_ratings", "Title", "Genres", genre_list)
+
+
+system1 <- function(genre){
+  tmp <- total_data %>% 
+    filter(total_data[,colnames(total_data)==genre] == 1) %>%
+    arrange(desc(ratings_per_movie)) %>%
+    head(10) %>% 
+    select(c(MovieID,Title,ratings_per_movie))
+  return(tmp)
+}
+```
+
+### System II: Recommendation Based on IBCF
+
+```{r}
+myurl = "https://liangfgithub.github.io/MovieData/"
+ratings = read.csv(paste0(myurl, 'ratings.dat?raw=true'), 
+                   sep = ':',
+                   colClasses = c('integer', 'NULL'), 
+                   header = FALSE)
+colnames(ratings) = c('UserID', 'MovieID', 'Rating', 'Timestamp')
+
+movies = readLines(paste0(myurl, 'movies.dat?raw=true'))
+movies = strsplit(movies, split = "::", fixed = TRUE, useBytes = TRUE)
+movies = matrix(unlist(movies), ncol = 3, byrow = TRUE)
+movies = data.frame(movies, stringsAsFactors = FALSE)
+colnames(movies) = c('MovieID', 'Title', 'Genres')
+movies$MovieID = as.integer(movies$MovieID)
+
+
+##sorted random movie ids
+random_movie_ids <- sample(unique(ratings$MovieID), 120)
+sorted_random_movie_ids <- sort(random_movie_ids)
+
+##movie images
+small_image_url = "https://liangfgithub.github.io/MovieImages/"
+random_movie_images <- paste0(small_image_url, sorted_random_movie_ids, '.jpg?raw=true')
+movies$image_url <- paste0(small_image_url, movies$MovieID, '.jpg?raw=true')
+# convert accented characters
+movies$Title = iconv(movies$Title, "latin1", "UTF-8")
+
+
+## Step1: construct rating matrix and normalized it
+rating_matrix <- dcast(ratings,
+                       UserID ~ MovieID,
+                       value.var = "Rating",
+                       fill = NA)
+rownames(rating_matrix) <- rating_matrix[, 1]
+rating_matrix <- rating_matrix[, -1]
+
+row_means <- rowMeans(rating_matrix, na.rm = TRUE)
+normalized_matrix <- rating_matrix - row_means
+
+
+## Step 2: compute Cosine similarity
+create_mask_matrix <- function(ratings_matrix, threshold = 3) {
+  num_movies <- ncol(ratings_matrix)
+  non_na_matrix <- (!is.na(ratings_matrix)) + 0
+  common_reviews_matrix <- t(non_na_matrix) %*% non_na_matrix
+  mask_matrix <- matrix(NA, nrow = num_movies, ncol = num_movies)
+  mask_matrix[common_reviews_matrix >= threshold] <- 1
+  return(mask_matrix)
+}
+
+mask_matrix <- create_mask_matrix(normalized_matrix)
+
+similarity_matrix <- coop::cosine(normalized_matrix, use = 'pairwise.complete.obs')
+similarity_matrix <- 1/2 + 1/2 * similarity_matrix
+similarity_matrix <- similarity_matrix * mask_matrix
+diag(similarity_matrix) = NA
+similarity_matrix[c("1","10","100","1510","260","3212"),c("1","10","100","1510","260","3212")]
+
+
+## Step 3
+sort_and_truncate <- function(similarity_matrix, top_k = 30) {
+  num_movies <- nrow(similarity_matrix)
+  truncated_matrix <- matrix(NA, nrow = num_movies, ncol = num_movies)
+  for (i in 1:num_movies) {
+    non_na_indices <- which(!is.na(similarity_matrix[i, ]))
+    sorted_values <- sort(similarity_matrix[i, non_na_indices], decreasing = TRUE)
+    top_k_values <- head(sorted_values, top_k)
+    truncated_matrix[i, non_na_indices] <- 
+      ifelse(similarity_matrix[i, non_na_indices] %in% top_k_values, similarity_matrix[i, non_na_indices], NA)
+  }
+  
+  return(truncated_matrix)
+}
+
+similarity_matrix <- sort_and_truncate(similarity_matrix)
+colnames(similarity_matrix) <- colnames(normalized_matrix)
+rownames(similarity_matrix) <- colnames(similarity_matrix)
+write.csv(similarity_matrix,"similarityMatrix.csv")
+
+
+## Step 4: myIBCF
+  # Function to compute predictions for unrated movies
+# Function to compute predictions for unrated movies
+predict_movies <- function(newuser, similarity_matrix) {
+    num_movies <- nrow(similarity_matrix)
+
+    # Iterate through unrated movies
+    unrated_movies <- which(is.na(newuser)) # unrated_movie储存了所有newuser里是na的index
+    # Initialize a vector for predictions
+    predictions <- rep(NA, length(unrated_movies))
+    
+    for (l in 1:length(unrated_movies)) {
+      # Find the movieID corresponding to the unrated_movie[l]。use thie movieID to access similarity_matrix
+      similarity_row_index <- rownames(similarity_matrix)==names(newuser)[unrated_movies[l]]
+      
+      # Get the 30-nearest neighbors of movie l
+      neighbors <- which(!is.na((similarity_matrix[similarity_row_index, ]))) 
+      if(length(neighbors)==0){
+        next
+      }
+      
+      # Compute the prediction for movie l
+      numerator <- sum(similarity_matrix[similarity_row_index, neighbors] * t(newuser[neighbors]), na.rm=TRUE)
+      
+      denominator_w <- neighbors[which(!is.na(newuser[neighbors]))]
+      denominator <- sum(similarity_matrix[similarity_row_index, denominator_w], na.rm=TRUE)
+      
+      # Check if the denominator is not zero
+      if (denominator != 0) {
+        predictions[l] <- numerator / denominator
+      }
+    }
+    names(predictions) <- names(newuser)[unrated_movies]
+    
+    if(sum(!is.na(predictions)) < 10) {
+      num <- 10 - sum(!is.na(predictions))
+      random_idx <- sample(is.na(predictions), num)
+      
+      predictions[names(random_idx)] <- 0
+    }
+    return(predictions)
+  }
+
+
+myIBCF <- function(newuser) {
+  # Load the similarity matrix(下面这行好像会让它运行特别久，暂时comment掉)
+  #similarity_matrix <- read.csv("similarityMatrix.csv", header = TRUE, row.names = 1)
+
+  # Compute predictions for unrated movies
+  predictions <- predict_movies(newuser, similarity_matrix)
+  # Recommend the top 10 movies
+  top_10_indices <- order(predictions, decreasing = TRUE, na.last = TRUE)[1:10]
+  top_10_movies <- names(predictions[top_10_indices])
+
+  # Display the top 10 recommended movies
+  print("Top 10 Recommended Movies:")
+  print(top_10_movies)
+
+  return(predictions[top_10_indices])
+}
+
+```
+
+
+### ShinyApp
+
+```{r}
+install.packages('rsconnect')
+rsconnect::setAccountInfo(name='stat542proj4',
+			  token='74515170E7B5C50F7703EB7C595F4E9F',
+			  secret='ryMUcQ3brcDKp2nTNx8UuLB3s2skt6rxfoLrQET3')
+# ui
+ui <- dashboardPage(
+
+  # Header
+  dashboardHeader(
+    title = tags$span(
+    style = "color: black;",
+    "Movie Recommender")
+    ),
+
+  # Sidebar
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Recommender by Genre", tabName = "genre", icon = icon("film")),
+      menuItem("Recommender by Rating", tabName = "rating", icon = icon("star"))
+      )
+    ),
+
+  # Body / Main content
+  dashboardBody(
+    tags$head(tags$style(HTML('
+                                /* logo */
+                                .skin-blue .main-header .logo {
+                                background-color: #c2dfff;
+                                }
+                                /* logo when hovered */
+                                .skin-blue .main-header .logo:hover {
+                                background-color: #c2dfff;
+                                }
+                                /* navbar (rest of the header) */
+                                .skin-blue .main-header .navbar {
+                                background-color: #c2dfff;
+                                }
+                                /* main sidebar */
+                                .skin-blue .main-sidebar {
+                                background-color: #c2dfff;
+                                }
+                                /* active selected tab in the sidebarmenu */
+                                .skin-blue .main-sidebar .sidebar .sidebar-menu .active a{
+                                background-color: #468BC6;
+                                }
+                                /* other links in the sidebarmenu */
+                                .skin-blue .main-sidebar .sidebar .sidebar-menu a{
+                                background-color: #c2dfff;
+                                color: #000000;
+                                }
+                                /* other links in the sidebarmenu when hovered */
+                                .skin-blue .main-sidebar .sidebar .sidebar-menu a:hover{
+                                background-color: #468BC6;
+                                }
+                                /* toggle button when hovered  */
+                                .skin-blue .main-header .navbar .sidebar-toggle:hover{
+                                background-color: #468BC6;
+                                }
+                                /* body */
+                                .content-wrapper, .right-side {
+                                background-color: #c2dfff;
+                                }
+                                /* Sidebar toggle icon color */
+                                .sidebar-toggle::before {
+                                color: black;
+                                }
+                              '))
+              ),
+
+    tabItems(
+      # First tab content
+      tabItem(
+        tabName = "genre",
+        fluidRow(
+          box(width = 12, status = "info", solidHeader = TRUE, collapsible = TRUE,
+              title = "Step 1: Select Your Favorite Genre",
+              div(class = "genreitems", uiOutput('genres_dropdown')))),
+        fluidRow(
+          useShinyjs(),
+          box(width = 12, status = "info", solidHeader = TRUE,
+              title = "Step 2: Discover movies you might like", br(),
+              withBusyIndicatorUI(
+                actionButton("genre_button", "Click here to get your recommendations", class = "btn-warning")),
+              br(),
+              tableOutput("results_by_genre")))),
+      
+      # Second tab content
+        tabItem(
+          tabName = "rating",
+          fluidRow(
+            box(width = 12, status = "info", solidHeader = TRUE, collapsible = TRUE,
+                title = "Step 1: Rate as many movies as possible",
+                lapply(1:120, function(i) {
+                  movie_id <- sorted_random_movie_ids[i]
+                  movie_title <- movies$Title[movies$MovieID == movie_id]
+                  img_tag <- tags$img(src = random_movie_images[i], width = 100, height = 150)
+                  column(2, img_tag, sliderInput(paste0("movie", i), movie_title, min = 1, max = 5, value = 1, step = 1,),
+                         style = "height:300px;", style = "text-align: center;")}))),
+          fluidRow(
+            useShinyjs(),
+            box(width = 12, status = "info", solidHeader = TRUE,
+                title = "Step 2: Discover movies you might like",
+                br(),
+                actionButton("submitBtn", "Click here to get your recommendations",
+                             class = "btn-warning", style = "margin-top: 5px; margin-bottom: 30px;"),
+                br(),
+                uiOutput("recommendedMovies"))))
+    )
+  )
+)
+
+
+# server
+server <- function(input, output) {
+  #genre dropdown
+  output$genres_dropdown <- renderUI({
+    selectInput("genreDropdown", "Genre:",c("Action", "Adventure", "Animation", 
+                                            "Children's", "Comedy", "Crime",
+                                            "Documentary", "Drama", "Fantasy",
+                                            "Film-Noir", "Horror", "Musical", 
+                                            "Mystery", "Romance", "Sci-Fi", 
+                                            "Thriller", "War", "Western"))
+  })
+  
+  
+  df_genre <- eventReactive(input$genre_button, {
+    withBusyIndicatorServer("genre_button", {
+      useShinyjs()
+      jsCode <- "document.querySelector('[data-widget=collapse]').click();"
+      runjs(jsCode)
+      
+      value_list = reactiveValuesToList(input)
+      selected_genre = value_list$genreDropdown
+      top_genre_movies = system1(selected_genre)
+      result <- data.table(Rank = 1:10, 
+                           MovieID = top_genre_movies$MovieID, 
+                           Title = top_genre_movies$Title)
+    })
+  })
+  
+  output$results_by_genre <- renderUI({
+    result <- df_genre()
+    lapply(1:2, function(i) {
+      list(fluidRow(lapply(1:5, function(j) {
+        movie_idx = (i - 1) * 5 + j
+        if (movie_idx <= nrow(result)) {
+          movie_id = result$MovieID[movie_idx]
+          movie_title = result$Title[movie_idx]
+          rec_movie = movies[movies$MovieID == movie_id,]
+          image_url = rec_movie$image_url
+
+          box(width = 2, title = NULL,
+              div(style = "text-align: center; height:350px;",
+              tags$p(style = "font-weight: bold; text-align: center;
+              font-size: 16px; color: white; background-color: #468BC6;
+              border: 1px solid #468BC6; padding: 5px; border-radius: 8px;",
+              paste("Rank", movie_idx)),
+              tags$img(src = image_url, style = "width:100px; height:150px;"),
+              div(style = "margin-top: 5px;", strong(movie_title))))
+        }      
+    })))
+  })
+})
+  
+  #movie rating
+  random_movie_ids <- sample(unique(ratings$MovieID), 120)
+  sorted_random_movie_ids <- sort(random_movie_ids)
+  
+  small_image_url = "https://liangfgithub.github.io/MovieImages/"
+  random_movie_images <- paste0(small_image_url, sorted_random_movie_ids, '.jpg?raw=true')
+  movies$image_url <- paste0(small_image_url, movies$MovieID, '.jpg?raw=true')
+  
+  user_ratings <- reactiveValues()
+
+  observeEvent(input$submitBtn, {
+    newuser <- rep(NA, ncol(rating_matrix))
+    
+    for (i in seq_along(sorted_random_movie_ids)) {
+      movie_id <- sorted_random_movie_ids[i]
+      input_name <- paste0("movie", i)
+      newuser[colnames(rating_matrix) == movie_id] <- input[[input_name]]
+    }
+
+    newuser <- data.frame(t(newuser))
+    colnames(newuser) <- colnames(rating_matrix)
+
+    predictions <- predict_movies(newuser, similarity_matrix)
+
+    top_10_indices <- order(predictions, decreasing = TRUE, na.last = TRUE)[1:10]
+    top_10_movies <- names(predictions[top_10_indices])
+    top_10_movies_data <- movies[movies$MovieID %in% as.numeric(top_10_movies), ]
+
+    output$recommendedMovies <- renderUI({
+      movie_elements <- lapply(1:10, function(i) {
+        rank <- paste("Rank", i)
+        movie_id <- top_10_movies_data$MovieID[i]
+        movie_title <- top_10_movies_data$Title[i]
+        img_tag <- tags$img(src = top_10_movies_data$image_url[i], width = 100, height = 150)
+
+        movie_box <- tags$div(column(width = 2, tags$p(style = "font-weight: bold;
+                                                       text-align: center;
+                                                       font-size: 16px;
+                                                       color: white;
+                                                       background-color: #468BC6;
+                                                       border: 1px solid #468BC6;
+                                                       padding: 5px;
+                                                       border-radius: 8px;", rank),
+                                     img_tag, div(style = "font-weight: bold;
+                                                  margin-top: 5px;
+                                                  text-align: center;", movie_title),
+                                     style = "height:250px; text-align: center;
+                                     border: 2px solid #ddd; padding: 10px;
+                                     border-radius: 8px; margin: 5px;
+                                     box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);"))
+        movie_box})
+      
+      rows <- lapply(1:2, function(row_idx) {
+        start_idx <- 5 * (row_idx - 1) + 1
+        end_idx <- min(5 * row_idx, 10)
+        fluidRow(do.call(tagList, movie_elements[start_idx:end_idx]))
+      })
+      tagList(rows)
+    })
+  })
+}
+
+# shinyAPP
+shinyApp(ui = ui, server = server)
+```
+
